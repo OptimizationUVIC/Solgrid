@@ -30,9 +30,9 @@ capital = CAPITAL_INIT
 pivot = None
 pivot_ts = None
 open_trade = None
-
 wins = 0
 losses = 0
+last_ts = None  # Pour ne pas retraiter deux fois la même bougie
 
 # === FETCH LATEST DATA ===
 def fetch_latest_klines(symbol=SYMBOL, interval=INTERVAL, lookback=ATR_PERIOD+2):
@@ -45,7 +45,7 @@ def fetch_latest_klines(symbol=SYMBOL, interval=INTERVAL, lookback=ATR_PERIOD+2)
         "ts", "open", "high", "low", "close", "volume",
         "ct", "qav", "nt", "tb", "tq", "ig"
     ])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
     df = df[["ts", "open", "high", "low", "close"]]
     df["atr"] = (df["high"] - df["low"]).rolling(ATR_PERIOD).mean()
@@ -95,7 +95,6 @@ def process_bar(row):
 
     # TP or Stop
     if open_trade:
-        # Take profit
         if high >= open_trade["tp"]:
             exit_price = open_trade["tp"]
             qty = open_trade["qty"]
@@ -105,7 +104,6 @@ def process_bar(row):
             wins += 1
             print(f"[{now}] ✅ TP hit: {pnl - fee:.2f} USDT")
             open_trade = None
-        # Stop-grid
         elif close <= pivot * (1 - STOP_GRID):
             exit_price = close
             qty = open_trade["qty"]
@@ -118,21 +116,22 @@ def process_bar(row):
             open_trade = None
             pivot, pivot_ts = close, now
 
-# === LIVE LOOP ===
+# === MAIN LOOP ===
 if __name__ == "__main__":
-    print("🔁 Starting Adaptive Grid Live Paper Bot in loop...")
+    print("🔁 Starting Adaptive Grid Live Paper Bot...")
     while True:
         try:
             df = fetch_latest_klines()
-            process_bar(df.iloc[-1])
-            total_trades = wins + losses
-            winrate = (wins / total_trades * 100) if total_trades > 0 else 0
-            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}] Equity: {equity:.2f} | Trades: {total_trades} | Winrate: {winrate:.1f}%")
+            last_candle = df.iloc[-1]
+            ts = last_candle.ts
+
+            if ts != last_ts:
+                process_bar(last_candle)
+                last_ts = ts
+                total_trades = wins + losses
+                winrate = (wins / total_trades * 100) if total_trades > 0 else 0
+                print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Equity: {equity:.2f} | Trades: {total_trades} | Winrate: {winrate:.1f}%")
         except Exception as e:
             print(f"❌ Error: {e}")
 
-        # Wait until next 30m candle close
-        now = datetime.now(timezone.utc)
-        next_run = (now + timedelta(minutes=30)).replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
-        sleep_secs = (next_run - now).total_seconds()
-        time.sleep(max(sleep_secs, 0))
+        time.sleep(5)  # léger délai, pour ne pas spammer l'API
