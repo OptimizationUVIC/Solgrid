@@ -4,38 +4,35 @@ import time
 from datetime import datetime, timezone, timedelta
 
 # === CONFIGURATION ===
-SYMBOL        = "SOLUSDT"
-INTERVAL      = "30m"
-CAPITAL_INIT  = 100.0
+SYMBOL = "SOLUSDT"
+INTERVAL = "30m"
+CAPITAL_INIT = 100.0
 
-ATR_PERIOD    = 14
-STEP_MULT     = 1.6
-TP_MULT       = 1.5
-MIN_STEP_PCT  = 0.002
-MAX_STEP_PCT  = 0.007
-MIN_TP_PCT    = 0.002
-MAX_TP_PCT    = 0.01
+ATR_PERIOD = 14
+STEP_MULT = 1.6
+TP_MULT = 1.5
+MIN_STEP_PCT = 0.002
+MAX_STEP_PCT = 0.007
+MIN_TP_PCT = 0.002
+MAX_TP_PCT = 0.01
 
-LEVELS        = 6
-ORDER_RISK    = 0.06
-STOP_GRID     = 0.04
-RESET_PERIOD  = timedelta(hours=12)
-RESET_THRESH  = 0.015
-FEE_PCT       = 0.0004
-LEVERAGE      = 10
+LEVELS = 6
+ORDER_RISK = 0.06
+STOP_GRID = 0.04
+RESET_PERIOD = timedelta(hours=12)
+RESET_THRESH = 0.015
+FEE_PCT = 0.0004
+LEVERAGE = 10
 
-# State variables
-equity = CAPITAL_INIT
-capital = CAPITAL_INIT
-pivot = None
-pivot_ts = None
+# === STATE ===
+equity = capital = CAPITAL_INIT
+pivot = pivot_ts = None
 open_trade = None
-wins = 0
-losses = 0
-last_ts = None  # Pour ne pas retraiter deux fois la même bougie
+wins = losses = 0
+last_processed_ts = None
 
-# === FETCH LATEST DATA ===
-def fetch_latest_klines(symbol=SYMBOL, interval=INTERVAL, lookback=ATR_PERIOD+2):
+# === FETCH DATA ===
+def fetch_latest_klines(symbol=SYMBOL, interval=INTERVAL, lookback=ATR_PERIOD + 2):
     url = "https://fapi.binance.com/fapi/v1/klines"
     end = int(time.time() * 1000)
     start = end - lookback * 30 * 60 * 1000
@@ -45,7 +42,7 @@ def fetch_latest_klines(symbol=SYMBOL, interval=INTERVAL, lookback=ATR_PERIOD+2)
         "ts", "open", "high", "low", "close", "volume",
         "ct", "qav", "nt", "tb", "tq", "ig"
     ])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
     df = df[["ts", "open", "high", "low", "close"]]
     df["atr"] = (df["high"] - df["low"]).rolling(ATR_PERIOD).mean()
@@ -61,12 +58,11 @@ def process_bar(row):
     if pivot is None:
         pivot, pivot_ts = close, now
 
-    # Compute adaptive steps
     step_pct = min(max((atr / close) * STEP_MULT, MIN_STEP_PCT), MAX_STEP_PCT)
-    tp_pct   = min(max((atr / close) * TP_MULT, MIN_TP_PCT), MAX_TP_PCT)
+    tp_pct = min(max((atr / close) * TP_MULT, MIN_TP_PCT), MAX_TP_PCT)
     next_buy = [pivot * (1 - step_pct * (i + 1)) for i in range(LEVELS)]
 
-    # Reset pivot if needed
+    # Reset pivot
     if (now - pivot_ts >= RESET_PERIOD) or abs(close - pivot) / pivot >= RESET_THRESH:
         if open_trade:
             exit_price = close
@@ -74,13 +70,13 @@ def process_bar(row):
             pnl = (exit_price - open_trade["entry"]) * qty
             fee = FEE_PCT * qty * exit_price
             equity += pnl - fee
-            if pnl > 0: wins += 1
-            else: losses += 1
+            wins += 1 if pnl > 0 else 0
+            losses += 1 if pnl <= 0 else 0
             open_trade = None
         pivot, pivot_ts = close, now
         return
 
-    # Entry condition
+    # Entry
     if open_trade is None and next_buy and low <= next_buy[0]:
         entry = next_buy[0]
         if entry == 0:
@@ -110,28 +106,32 @@ def process_bar(row):
             pnl = (exit_price - open_trade["entry"]) * qty
             fee = FEE_PCT * qty * exit_price
             equity += pnl - fee
-            if pnl > 0: wins += 1
-            else: losses += 1
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
             print(f"[{now}] ❌ Stop hit: {pnl - fee:.2f} USDT")
             open_trade = None
             pivot, pivot_ts = close, now
 
-# === MAIN LOOP ===
+# === LIVE LOOP ===
 if __name__ == "__main__":
-    print("🔁 Starting Adaptive Grid Live Paper Bot...")
+    print("🔁 Starting Adaptive Grid Live Paper Bot in real-time loop...")
     while True:
         try:
             df = fetch_latest_klines()
-            last_candle = df.iloc[-1]
-            ts = last_candle.ts
+            last_bar = df.iloc[-1]
+            bar_ts = last_bar.ts
 
-            if ts != last_ts:
-                process_bar(last_candle)
-                last_ts = ts
+            if last_processed_ts is None or bar_ts > last_processed_ts:
+                process_bar(last_bar)
+                last_processed_ts = bar_ts
                 total_trades = wins + losses
                 winrate = (wins / total_trades * 100) if total_trades > 0 else 0
                 print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Equity: {equity:.2f} | Trades: {total_trades} | Winrate: {winrate:.1f}%")
+
+            time.sleep(5)  # Poll every 5 seconds
+
         except Exception as e:
             print(f"❌ Error: {e}")
-
-        time.sleep(5)  # léger délai, pour ne pas spammer l'API
+            time.sleep(10)
