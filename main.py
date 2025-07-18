@@ -18,7 +18,7 @@ MAX_TP_PCT = 0.01
 
 LEVELS = 6
 ORDER_RISK = 0.06
-STOP_GRID = 0.04
+STOP_GRID = 0.02
 RESET_PERIOD = timedelta(hours=12)
 RESET_THRESH = 0.015
 FEE_PCT = 0.0004
@@ -50,19 +50,20 @@ def fetch_latest_klines(symbol=SYMBOL, interval=INTERVAL, lookback=ATR_PERIOD + 
 
 # === PROCESS NEW BAR ===
 def process_bar(row):
-    global pivot, pivot_ts, open_trade, equity, wins, losses
+    global pivot, pivot_ts, open_trade, equity, wins, losses, capital
 
     now, high, low, close, atr = row.ts, row.high, row.low, row.close, row.atr
 
-    # Initialize pivot on first run
+    # Init pivot
     if pivot is None:
         pivot, pivot_ts = close, now
 
+    # Calcule step / tp dynamiques
     step_pct = min(max((atr / close) * STEP_MULT, MIN_STEP_PCT), MAX_STEP_PCT)
-    tp_pct = min(max((atr / close) * TP_MULT, MIN_TP_PCT), MAX_TP_PCT)
+    tp_pct   = min(max((atr / close) * TP_MULT,   MIN_TP_PCT), MAX_TP_PCT)
     next_buy = [pivot * (1 - step_pct * (i + 1)) for i in range(LEVELS)]
 
-    # Reset pivot
+    # Reset pivot (temps ou distance)
     if (now - pivot_ts >= RESET_PERIOD) or abs(close - pivot) / pivot >= RESET_THRESH:
         if open_trade:
             exit_price = close
@@ -70,49 +71,66 @@ def process_bar(row):
             pnl = (exit_price - open_trade["entry"]) * qty
             fee = FEE_PCT * qty * exit_price
             equity += pnl - fee
-            wins += 1 if pnl > 0 else 0
-            losses += 1 if pnl <= 0 else 0
+            wins += int(pnl > 0)
+            losses += int(pnl <= 0)
+            print(f"[{now}] 🔄 Pivot reset | Closed open trade: {pnl - fee:.2f} USDT")
             open_trade = None
+
         pivot, pivot_ts = close, now
+        capital = equity  # facultatif : capital dynamique
         return
 
-    # Entry
-    if open_trade is None and next_buy and low <= next_buy[0]:
+    # ENTRY
+    if open_trade is None and low <= next_buy[0]:
         entry = next_buy[0]
-        if entry == 0:
-            return
         risk_usdt = capital * ORDER_RISK
         qty = (risk_usdt * LEVERAGE) / entry
         tp = entry * (1 + tp_pct)
+        sl = entry * (1 - 1.2 * atr / close)
         fee = FEE_PCT * qty * entry
         equity -= fee
-        open_trade = {"entry": entry, "qty": qty, "tp": tp}
-        print(f"[{now}] 📈 Entry at {entry:.3f}, TP {tp:.3f}, Qty {qty:.4f}")
+        open_trade = {
+            "entry": entry,
+            "qty": qty,
+            "tp": tp,
+            "sl": sl,
+            "entry_ts": now
+        }
+        print(f"[{now}] 📈 Entry at {entry:.3f}, TP {tp:.3f}, SL {sl:.3f}, Qty {qty:.4f}")
+        return
 
-    # TP or Stop
+    # TP / SL / TIMEOUT
     if open_trade:
+        qty = open_trade["qty"]
+        entry_price = open_trade["entry"]
+
         if high >= open_trade["tp"]:
             exit_price = open_trade["tp"]
-            qty = open_trade["qty"]
-            pnl = (exit_price - open_trade["entry"]) * qty
+            pnl = (exit_price - entry_price) * qty
             fee = FEE_PCT * qty * exit_price
             equity += pnl - fee
             wins += 1
-            print(f"[{now}] ✅ TP hit: {pnl - fee:.2f} USDT")
             open_trade = None
-        elif close <= pivot * (1 - STOP_GRID):
-            exit_price = close
-            qty = open_trade["qty"]
-            pnl = (exit_price - open_trade["entry"]) * qty
+            print(f"[{now}] ✅ TP hit: {pnl - fee:.2f} USDT")
+
+        elif low <= open_trade["sl"]:
+            exit_price = open_trade["sl"]
+            pnl = (exit_price - entry_price) * qty
             fee = FEE_PCT * qty * exit_price
             equity += pnl - fee
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-            print(f"[{now}] ❌ Stop hit: {pnl - fee:.2f} USDT")
+            losses += 1
             open_trade = None
-            pivot, pivot_ts = close, now
+            print(f"[{now}] ❌ SL hit: {pnl - fee:.2f} USDT")
+
+        elif now - open_trade["entry_ts"] > timedelta(hours=6):
+            exit_price = close
+            pnl = (exit_price - entry_price) * qty
+            fee = FEE_PCT * qty * exit_price
+            equity += pnl - fee
+            wins += int(pnl > 0)
+            losses += int(pnl <= 0)
+            open_trade = None
+            print(f"[{now}] ⏳ Timeout exit: {pnl - fee:.2f} USDT")
 
 # === LIVE LOOP ===
 if __name__ == "__main__":
